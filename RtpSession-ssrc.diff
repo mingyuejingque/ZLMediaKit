@@ -1,0 +1,52 @@
+diff --git a/server/WebApi.cpp b/server/WebApi.cpp
+index 6e51f666..9c52aa43 100755
+--- a/server/WebApi.cpp
++++ b/server/WebApi.cpp
+@@ -51,6 +51,7 @@
+ 
+ #if defined(ENABLE_RTPPROXY)
+ #include "Rtp/RtpServer.h"
++#include "Rtp/RtpSession.h"
+ #endif
+ 
+ #ifdef ENABLE_WEBRTC
+@@ -1154,6 +1155,12 @@ void installWebApi() {
+             jsession["id"] = id;
+             jsession["type"] = session->getSock()->sockType() == SockNum::Sock_TCP ? "tcp" : "udp";
+             jsession["typeid"] = toolkit::demangle(typeid(*session).name());
++
++            //只有RtpSession才有ssrc成员
++            auto rtp_session = std::dynamic_pointer_cast<RtpSession>(session);
++            if (rtp_session) {
++                jsession["ssrc"] = rtp_session->ssrc();
++            }
+             val["data"].append(jsession);
+         });
+     });
+diff --git a/src/Rtp/RtpSession.cpp b/src/Rtp/RtpSession.cpp
+index 58078ece..6f751d6b 100644
+--- a/src/Rtp/RtpSession.cpp
++++ b/src/Rtp/RtpSession.cpp
+@@ -150,6 +150,10 @@ void RtpSession::onRtpPacket(const char *data, size_t len) {
+     _ticker.resetTime();
+ }
+ 
++uint32_t RtpSession::ssrc() {
++    return _ssrc;
++}
++
+ static const char *findSSRC(const char *data, ssize_t len, uint32_t ssrc) {
+     // rtp前面必须预留两个字节的长度字段  [AUTO-TRANSLATED:2af4e647]
+     // Two bytes of length field must be reserved before rtp
+diff --git a/src/Rtp/RtpSession.h b/src/Rtp/RtpSession.h
+index 25d1af91..72cf33d6 100644
+--- a/src/Rtp/RtpSession.h
++++ b/src/Rtp/RtpSession.h
+@@ -37,6 +37,7 @@ public:
+     void setParams(toolkit::mINI &ini);
+     void attachServer(const toolkit::Server &server) override;
+     void setRtpProcess(RtpProcess::Ptr process);
++    uint32_t ssrc();
+ 
+ protected:
+     // 收到rtp回调  [AUTO-TRANSLATED:446b2cda]
