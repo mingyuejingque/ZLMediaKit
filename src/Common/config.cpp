@@ -30,7 +30,22 @@ bool loadIniConfig(const char *ini_path) {
         ini = exePath() + ".ini";
     }
     try {
-        mINI::Instance().parseFile(ini);
+        mINI tmp;
+        tmp.parseFile(ini);
+
+        auto &ref = mINI::Instance();
+        for (auto &pr : tmp) {
+            if (ref.find(pr.first) == ref.end()) {
+                // 新增键
+                WarnL << "unknow config: " << pr.first << " = " << pr.second;
+                ref.emplace(pr);
+            } else {
+                // 更新键
+                ref[pr.first] = pr.second;
+            }
+        }
+        // 更新注释和排序
+        ref.updateFrom(tmp);
         NOTICE_EMIT(BroadcastReloadConfigArgs, Broadcast::kBroadcastReloadConfig);
         return true;
     } catch (std::exception &) {
@@ -66,6 +81,8 @@ const string kBroadcastRtcSctpClosed = "kBroadcastRtcSctpClosed";
 const string kBroadcastRtcSctpSend = "kBroadcastRtcSctpSend";
 const string kBroadcastRtcSctpReceived = "kBroadcastRtcSctpReceived";
 const string kBroadcastPlayerCountChanged = "kBroadcastPlayerCountChanged";
+const string kBroadcastPlayerProxyFailed = "kBroadcastPlayerProxyFailed";
+const string kBroadcastCreateMuxer = "kBroadcastCreateMuxer";
 
 } // namespace Broadcast
 
@@ -338,6 +355,7 @@ const string kFileBufSize = HLS_FIELD "fileBufSize";
 const string kBroadcastRecordTs = HLS_FIELD "broadcastRecordTs";
 const string kDeleteDelaySec = HLS_FIELD "deleteDelaySec";
 const string kFastRegister = HLS_FIELD "fastRegister";
+const string kFmp4SegExt = HLS_FIELD "fmp4SegExt";
 
 static onceToken token([]() {
     mINI::Instance()[kSegmentDuration] = 2;
@@ -349,6 +367,7 @@ static onceToken token([]() {
     mINI::Instance()[kBroadcastRecordTs] = false;
     mINI::Instance()[kDeleteDelaySec] = 10;
     mINI::Instance()[kFastRegister] = false;
+    mINI::Instance()[kFmp4SegExt] = ".mp4";
 });
 } // namespace Hls
 
@@ -398,6 +417,7 @@ const string kWaitTrackReady = "wait_track_ready";
 const string kPlayTrack = "play_track";
 const string kProxyUrl = "proxy_url";
 const string kRtspSpeed = "rtsp_speed";
+const string kSchema = "schema";
 const string kLatency = "latency";
 const string kPassPhrase = "passPhrase";
 const string kCustomHeader = "custom_header";

@@ -82,6 +82,7 @@ const string kMinBitrate = RTC_FIELD "min_bitrate";
 // 数据通道设置  [AUTO-TRANSLATED:2dc48bc3]
 // Data channel setting
 const string kDataChannelEcho = RTC_FIELD "datachannel_echo";
+const string kPreferredTcp = RTC_FIELD "preferred_tcp";
 
 static onceToken token([]() {
     mINI::Instance()[kTimeOutSec] = 15;
@@ -105,6 +106,7 @@ static onceToken token([]() {
     mINI::Instance()[kIceTransportPolicy] = 0;  // 默认值：不限制(kAll)
     mINI::Instance()[kIceUfrag] = "ZLMediaKit";
     mINI::Instance()[kIcePwd] = "ZLMediaKit";
+    mINI::Instance()[kPreferredTcp] = 0;
 });
 
 } // namespace Rtc
@@ -135,7 +137,12 @@ static std::string getServerPrefix() {
     // 拷贝tcp端口  [AUTO-TRANSLATED:23191878]
     // Copy tcp port
     memcpy(buf + 6, &(reinterpret_cast<sockaddr_in *>(&addr)->sin_port), 2);
-    auto ret = encodeBase64(string(buf, 8)) + '_';
+    // RFC 5245 §15.4: ice-char = ALPHA / DIGIT / "+" / "/"
+    auto ret = encodeBase64(string(buf, 8));
+    // Remove base64 '=' padding (not a valid ice-char)
+    ret.erase(std::remove(ret.begin(), ret.end(), '='), ret.end());
+    // Use '/' separator instead of '_' (not a valid ice-char)
+    ret += '/';
     InfoL << "MediaServer(" << host << ":" << udp_port << ":" << tcp_port << ") prefix: " << ret;
     return ret;
 }
@@ -1102,7 +1109,7 @@ void WebRtcTransportImp::setIceCandidate(vector<SdpAttrCandidate> cands) {
 
 class RtpChannel : public RtpTrackImp, public std::enable_shared_from_this<RtpChannel> {
 public:
-    RtpChannel(EventPoller::Ptr poller, RtpTrackImp::OnSorted cb, function<void(const FCI_NACK &nack)> on_nack) {
+    RtpChannel(TrackType type, EventPoller::Ptr poller, RtpTrackImp::OnSorted cb, function<void(const FCI_NACK &nack)> on_nack) : _nack_ctx(type){
         _poller = std::move(poller);
         _on_nack = std::move(on_nack);
         setOnSorted(std::move(cb));
@@ -1314,7 +1321,7 @@ void WebRtcTransportImp::createRtpChannel(const string &rid, uint32_t ssrc, Medi
     // rid --> RtpReceiverImp
     auto &ref = track.rtp_channel[rid];
     weak_ptr<WebRtcTransportImp> weak_self = static_pointer_cast<WebRtcTransportImp>(shared_from_this());
-    ref = std::make_shared<RtpChannel>(
+    ref = std::make_shared<RtpChannel>(track.media->type,
         getPoller(), [&track, this, rid](RtpPacket::Ptr rtp) mutable { onSortedRtp(track, rid, std::move(rtp)); },
         [&track, weak_self, ssrc](const FCI_NACK &nack) mutable {
             // nack发送可能由定时器异步触发  [AUTO-TRANSLATED:186d6723]
@@ -1631,6 +1638,7 @@ WebRtcPluginManager &WebRtcPluginManager::Instance() {
 }
 
 void WebRtcPluginManager::registerPlugin(const string &type, Plugin cb) {
+    InfoL << "Load webrtc plugin:" << type;
     lock_guard<mutex> lck(_mtx_creator);
     _map_creator[type] = std::move(cb);
 }
@@ -1667,6 +1675,7 @@ void echo_plugin(SocketHelper& sender, const WebRtcArgs &args, const onCreateWeb
     cb(*WebRtcEchoTest::create(EventPollerPool::Instance().getPoller()));
 }
 
+template<typename Type>
 void push_plugin(SocketHelper& sender, const WebRtcArgs &args, const onCreateWebRtc &cb) {
     MediaInfo info(args["url"]);
     Broadcast::PublishAuthInvoker invoker = [cb, info](const string &err, const ProtocolOption &option) mutable {
@@ -1711,7 +1720,7 @@ void push_plugin(SocketHelper& sender, const WebRtcArgs &args, const onCreateWeb
             push_src_ownership = push_src->getOwnership();
             push_src->setProtocolOption(option);
         }
-        auto rtc = WebRtcPusher::create(EventPollerPool::Instance().getPoller(), push_src, push_src_ownership, info, option, 
+        auto rtc = Type::create(EventPollerPool::Instance().getPoller(), push_src, push_src_ownership, info, option,
             WebRtcTransport::Role::PEER, WebRtcTransport::SignalingProtocols::WHEP_WHIP);
         push_src->setListener(rtc);
         cb(*rtc);
@@ -1782,9 +1791,12 @@ static void setWebRtcArgs(const WebRtcArgs &args, WebRtcInterface &rtc) {
         }
     }
 
-    bool preferred_tcp = args["preferred_tcp"];
-    {
+    auto preferred_tcp = args["preferred_tcp"];
+    if (!preferred_tcp.empty()) {
         rtc.setPreferredTcp(preferred_tcp);
+    } else {
+        GET_CONFIG(bool, s_preferred_tcp, Rtc::kPreferredTcp);
+        rtc.setPreferredTcp(s_preferred_tcp);
     }
 
     {
@@ -1832,7 +1844,7 @@ static onceToken s_rtc_auto_register([]() {
     // Enable echo plugin only in debug mode
     WebRtcPluginManager::Instance().registerPlugin("echo", echo_plugin);
 #endif
-    WebRtcPluginManager::Instance().registerPlugin("push", push_plugin);
+    WebRtcPluginManager::Instance().registerPlugin("push", push_plugin<WebRtcPusher>);
     WebRtcPluginManager::Instance().registerPlugin("play", play_plugin<WebRtcPlayer>);
     WebRtcPluginManager::Instance().registerPlugin("talk", play_plugin<WebRtcTalk>);
 

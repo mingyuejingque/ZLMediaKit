@@ -101,21 +101,21 @@ using HttpApi = function<void(const Parser &parser, const HttpSession::HttpRespo
 // http api list
 static map<string, HttpApi, StrCaseCompare> s_map_api;
 
-static void responseApi(const Json::Value &res, const HttpSession::HttpResponseInvoker &invoker){
-    GET_CONFIG(string, charSet, Http::kCharSet);
-    HttpSession::KeyValue headerOut;
-    headerOut["Content-Type"] = string("application/json; charset=") + charSet;
-    invoker(200, headerOut, res.toStyledString());
-};
-
-static void responseApi(int code, const string &msg, const HttpSession::HttpResponseInvoker &invoker){
+static void responseApi(int code, const string &msg, const HttpSession::HttpResponseInvoker &invoker, ApiRetException *ex = nullptr){
     Json::Value res;
+    HttpSession::KeyValue headerOut;
+    if (ex) {
+        res = ex->getBody();
+        headerOut = ex->getHeaders();
+    }
     res["code"] = code;
     res["msg"] = msg;
-    responseApi(res, invoker);
-}
 
-static ApiArgsType getAllArgs(const Parser &parser);
+    GET_CONFIG(string, charSet, Http::kCharSet);
+    headerOut["Content-Type"] = string("application/json; charset=") + charSet;
+
+    invoker(200, headerOut, res.toStyledString());
+}
 
 static HttpApi toApi(const function<void(API_ARGS_MAP_ASYNC)> &cb) {
     return [cb](const Parser &parser, const HttpSession::HttpResponseInvoker &invoker, SockInfo &sender) {
@@ -215,7 +215,7 @@ void api_regist(const string &api_path, const function<void(API_ARGS_STRING_ASYN
 
 // 获取HTTP请求中url参数、content参数  [AUTO-TRANSLATED:d161a1e1]
 // Get URL parameters and content parameters from the HTTP request
-static ApiArgsType getAllArgs(const Parser &parser) {
+ApiArgsType getAllArgs(const Parser &parser) {
     ApiArgsType allArgs;
     if (parser["Content-Type"].find("application/x-www-form-urlencoded") == 0) {
         auto contentArgs = parser.parseArgs(parser.content());
@@ -223,16 +223,18 @@ static ApiArgsType getAllArgs(const Parser &parser) {
             allArgs[pr.first] = strCoding::UrlDecodeComponent(pr.second);
         }
     } else if (parser["Content-Type"].find("application/json") == 0) {
-        try {
-            stringstream ss(parser.content());
-            Value jsonArgs;
-            ss >> jsonArgs;
-            auto keys = jsonArgs.getMemberNames();
-            for (auto key = keys.begin(); key != keys.end(); ++key) {
-                allArgs[*key] = jsonArgs[*key].asString();
+        if (!parser.content().empty()) {
+            try {
+                stringstream ss(parser.content());
+                Value jsonArgs;
+                ss >> jsonArgs;
+                auto keys = jsonArgs.getMemberNames();
+                for (auto key = keys.begin(); key != keys.end(); ++key) {
+                    allArgs[*key] = jsonArgs[*key].asString();
+                }
+            } catch (std::exception &ex) {
+                WarnL << ex.what();
             }
-        } catch (std::exception &ex) {
-            WarnL << ex.what();
         }
     } else if (!parser["Content-Type"].empty()) {
         WarnL << "invalid Content-Type:" << parser["Content-Type"];
@@ -306,12 +308,12 @@ static inline void addHttpListener(){
             try {
                 it->second(parser, invoker, *helper);
             } catch (ApiRetException &ex) {
-                responseApi(ex.code(), ex.what(), invoker);
+                responseApi(ex.code(), ex.what(), invoker, &ex);
                 helper->getPoller()->async([helper, ex]() { helper->shutdown(SockException(Err_shutdown, ex.what())); }, false);
             }
 #ifdef ENABLE_MYSQL
             catch (SqlException &ex) {
-                responseApi(API::SqlFailed, StrPrinter << "操作数据库失败:" << ex.what() << ":" << ex.getSql(), invoker);
+                responseApi(API::SqlFailed, StrPrinter << "操作数据库失败:" << ex.what() << ":" << ex.getSql(), invoker, &ex);
             }
 #endif // ENABLE_MYSQL
             catch (std::exception &ex) {
@@ -345,7 +347,7 @@ static inline string getPusherKey(const string &schema, const string &vhost, con
     return schema + "/" + vhost + "/" + app + "/" + stream + "/" + MD5(dst_url).hexdigest();
 }
 
-static void fillSockInfo(Value& val, SockInfo* info) {
+void fillSockInfo(Value& val, SockInfo* info) {
     val["peer_ip"] = info->get_peer_ip();
     val["peer_port"] = info->get_peer_port();
     val["local_port"] = info->get_local_port();
@@ -365,7 +367,7 @@ Value ToJson(const PusherProxy::Ptr& p) {
     item["url"] = p->getUrl();
     item["status"] = p->getStatus();
     item["liveSecs"] = p->getLiveSecs();
-    item["rePublishCount"] = p->getRePublishCount();    
+    item["rePublishCount"] = p->getRePublishCount();
     item["bytesSpeed"] = (Json::UInt64) p->getSendSpeed();
     item["totalBytes"] =(Json::UInt64) p->getSendTotalBytes();
 
@@ -375,10 +377,53 @@ Value ToJson(const PusherProxy::Ptr& p) {
     return item;
 }
 
+Json::Value dumpTracks(const std::vector<Track::Ptr> &tracks) {
+    Json::Value ret(arrayValue);
+    for (auto &track : tracks) {
+        Value obj;
+        auto codec_type = track->getTrackType();
+        obj["codec_id"] = track->getCodecId();
+        obj["codec_id_name"] = track->getCodecName();
+        obj["ready"] = track->ready();
+        obj["codec_type"] = codec_type;
+        obj["frames"] = track->getFrames();
+        obj["duration"] = track->getDuration();
+        switch (codec_type) {
+            case TrackAudio: {
+                auto audio_track = dynamic_pointer_cast<AudioTrack>(track);
+                obj["sample_rate"] = audio_track->getAudioSampleRate();
+                obj["channels"] = audio_track->getAudioChannel();
+                obj["sample_bit"] = audio_track->getAudioSampleBit();
+                break;
+            }
+            case TrackVideo: {
+                auto video_track = dynamic_pointer_cast<VideoTrack>(track);
+                obj["width"] = video_track->getVideoWidth();
+                obj["height"] = video_track->getVideoHeight();
+                obj["key_frames"] = video_track->getVideoKeyFrames();
+                int gop_size = video_track->getVideoGopSize();
+                int gop_interval_ms = video_track->getVideoGopInterval();
+                float fps = video_track->getVideoFps();
+                if (fps <= 1 && gop_interval_ms) {
+                    fps = gop_size * 1000.0 / gop_interval_ms;
+                }
+                obj["fps"] = round(fps);
+                obj["gop_size"] = gop_size;
+                obj["gop_interval_ms"] = gop_interval_ms;
+                break;
+            }
+            default: break;
+        }
+        ret.append(obj);
+    }
+    return ret;
+}
+
 Value ToJson(const PlayerProxy::Ptr& p) {
     Value item;
     item["url"] = p->getUrl();
     item["status"] = p->getStatus();
+    item["status_str"] = p->getStatusStr();
     item["liveSecs"] = p->getLiveSecs();
     item["rePullCount"] = p->getRePullCount();
     item["totalReaderCount"] = p->totalReaderCount();
@@ -386,10 +431,11 @@ Value ToJson(const PlayerProxy::Ptr& p) {
     item["totalBytes"] = (Json::UInt64) p->getRecvTotalBytes();
 
     dumpMediaTuple(p->getMediaTuple(), item["src"]);
+    item["tracks"] = dumpTracks(p->getTracks(false));
     return item;
 }
 
-Value makeMediaSourceJson(MediaSource &media){
+Value makeMediaSourceJson(MediaSource &media) {
     Value item;
     item["schema"] = media.getSchema();
     dumpMediaTuple(media.getMediaTuple(), item);
@@ -417,17 +463,13 @@ Value makeMediaSourceJson(MediaSource &media){
     auto current_thread = false;
     try { current_thread = media.getOwnerPoller()->isCurrentThread();} catch (...) {}
     float last_loss = -1;
-    for(auto &track : media.getTracks(false)){
-        Value obj;
-        auto codec_type = track->getTrackType();
-        obj["codec_id"] = track->getCodecId();
-        obj["codec_id_name"] = track->getCodecName();
-        obj["ready"] = track->ready();
-        obj["codec_type"] = codec_type;
-        if (current_thread) {
+    auto tracks = dumpTracks(media.getTracks(false));
+    if (current_thread) {
+        for (auto &obj : tracks) {
             // rtp推流只有一个统计器，但是可能有多个track，如果短时间多次获取间隔丢包率，第二次会获取为-1  [AUTO-TRANSLATED:5bfbc951]
-            // RTP push stream has only one statistics, but may have multiple tracks. If you get the interval packet loss rate multiple times in a short time, the second time will get -1
-            auto loss = media.getLossRate(codec_type);
+            // RTP push stream has only one statistics, but may have multiple tracks. If you get the interval packet loss rate multiple times in a short time,
+            // the second time will get -1
+            auto loss = media.getLossRate(getTrackType(static_cast<CodecId>(obj["codec_type"].asInt())));
             if (loss == -1) {
                 loss = last_loss;
             } else {
@@ -435,37 +477,8 @@ Value makeMediaSourceJson(MediaSource &media){
             }
             obj["loss"] = loss;
         }
-        obj["frames"] = track->getFrames();
-        obj["duration"] = track->getDuration();
-        switch(codec_type){
-            case TrackAudio : {
-                auto audio_track = dynamic_pointer_cast<AudioTrack>(track);
-                obj["sample_rate"] = audio_track->getAudioSampleRate();
-                obj["channels"] = audio_track->getAudioChannel();
-                obj["sample_bit"] = audio_track->getAudioSampleBit();
-                break;
-            }
-            case TrackVideo : {
-                auto video_track = dynamic_pointer_cast<VideoTrack>(track);
-                obj["width"] = video_track->getVideoWidth();
-                obj["height"] = video_track->getVideoHeight();
-                obj["key_frames"] = video_track->getVideoKeyFrames();
-                int gop_size = video_track->getVideoGopSize();
-                int gop_interval_ms = video_track->getVideoGopInterval();
-                float fps = video_track->getVideoFps();
-                if (fps <= 1 && gop_interval_ms) {
-                    fps = gop_size * 1000.0 / gop_interval_ms;
-                }
-                obj["fps"] = round(fps);
-                obj["gop_size"] = gop_size;
-                obj["gop_interval_ms"] = gop_interval_ms;
-                break;
-            }
-            default:
-                break;
-        }
-        item["tracks"].append(obj);
     }
+    item["tracks"] = std::move(tracks);
     return item;
 }
 
@@ -579,8 +592,19 @@ void getStatisticJson(const function<void(Value &val)> &cb) {
 #endif
 }
 
-void addStreamProxy(const MediaTuple &tuple, const string &url, int retry_count,
-                    const ProtocolOption &option, int rtp_type, float timeout_sec, const mINI &args,
+void updateStreamProxy(const mediakit::MediaTuple &tuple, const std::string &url, const toolkit::mINI &args) {
+    auto key = tuple.shortUrl();
+    auto player = s_player_proxy.find(key);
+    if (!player) {
+        throw std::runtime_error("proxy player not found: " + key);
+    }
+    player->getPoller()->async([url, args, player]() {
+        player->update(url, args);
+    });
+}
+
+void addStreamProxy(const MediaTuple &tuple, const string &url, int retry_count, bool force,
+                    const ProtocolOption &option, float timeout_sec, const mINI &args,
                     const function<void(const SockException &ex, const string &key)> &cb) {
     auto key = tuple.shortUrl();
     if (s_player_proxy.find(key)) {
@@ -599,10 +623,6 @@ void addStreamProxy(const MediaTuple &tuple, const string &url, int retry_count,
         (*player)[pr.first] = pr.second;
     }
 
-    // 指定RTP over TCP(播放rtsp时有效)  [AUTO-TRANSLATED:1a062656]
-    // Specify RTP over TCP (effective when playing RTSP)
-    (*player)[Client::kRtpType] = rtp_type;
-
     if (timeout_sec > 0.1f) {
         // 播放握手超时时间  [AUTO-TRANSLATED:5a29ae1f]
         // Play handshake timeout
@@ -611,11 +631,18 @@ void addStreamProxy(const MediaTuple &tuple, const string &url, int retry_count,
 
     // 开始播放，如果播放失败或者播放中止，将会自动重试若干次，默认一直重试  [AUTO-TRANSLATED:ac8499e5]
     // Start playing. If playback fails or is stopped, it will automatically retry several times, by default it will retry indefinitely
-    player->setPlayCallbackOnce([cb, key](const SockException &ex) {
-        if (ex) {
-            s_player_proxy.erase(key);
+    player->setPlayCallbackOnce([cb, key, force](const SockException &ex) {
+        if (force) {
+            // 强制添加成功
+            cb(SockException(), key);
+        } else {
+            // 非强制添加
+            if (ex) {
+                // 失败则移除记录
+                s_player_proxy.erase(key);
+            }
+            cb(ex, key);
         }
-        cb(ex, key);
     });
 
     // 被主动关闭拉流  [AUTO-TRANSLATED:41a19476]
@@ -710,6 +737,53 @@ void getThreadsLoad(TaskExecutorGetterImp &getter, API_ARGS_MAP_ASYNC) {
     });
 }
 
+static constexpr char kLoginCookiePath[] = "/";
+static constexpr char kUnLoginCookieName[] = "ZLM_UNLOGIN";
+static constexpr char kLoginedCookieName[] = "ZLM_LOGINED";
+static constexpr size_t kUnLoginCookieLifeSeconds = 60;
+static constexpr size_t kLoginedCookieLifeSeconds = 24 * 3600;
+
+template <typename T>
+void check_secret(toolkit::SockInfo &sender, mediakit::HttpSession::KeyValue &headerOut, const HttpAllArgs<T> &allArgs, Json::Value &val) {
+    GET_CONFIG(std::string, api_secret, API::kSecret);
+
+    auto ip = sender.get_peer_ip();
+    if (!HttpFileManager::isIPAllowed(ip)) {
+        throw AuthException("Your ip is not allowed to access the service.");
+    }
+
+    try {
+        auto logined_cookie = HttpCookieManager::Instance().getCookie(kLoginedCookieName, allArgs.getParser().getHeader());
+        if (!logined_cookie) {
+            auto unlogin_cookie = HttpCookieManager::Instance().getCookie(kUnLoginCookieName, allArgs.getParser().getHeader());
+            if (!unlogin_cookie) {
+                unlogin_cookie = HttpCookieManager::Instance().addCookie(kUnLoginCookieName, "", kUnLoginCookieLifeSeconds);
+                headerOut["Set-Cookie"] = unlogin_cookie->getCookie(kLoginCookiePath);
+            }
+            val["cookie"] = unlogin_cookie->getCookie();
+            throw AuthException("Please login first", headerOut, val);
+        }
+        // 优先cookie登陆鉴权
+    } catch (...) {
+        try {
+            // cookie登陆鉴权失败了再比对secret
+            CHECK_ARGS("secret");
+            if (api_secret != allArgs["secret"]) {
+                throw AuthException("Incorrect secret");
+            }
+            return;
+        } catch (...) {
+            // 未提供secret或secret不匹配，这个异常隐藏
+        }
+        // secret鉴权模式失败，抛出要求cookie登录的异常
+        throw;
+    }
+}
+
+template void check_secret<ApiArgsType>(toolkit::SockInfo &, mediakit::HttpSession::KeyValue &, const HttpAllArgs<ApiArgsType> &, Json::Value &);
+template void check_secret<Json::Value>(toolkit::SockInfo &, mediakit::HttpSession::KeyValue &, const HttpAllArgs<Json::Value> &, Json::Value &);
+template void check_secret<std::string>(toolkit::SockInfo &, mediakit::HttpSession::KeyValue &, const HttpAllArgs<std::string> &, Json::Value &);
+
 /**
  * 安装api接口
  * 所有api都支持GET和POST两种方式
@@ -722,7 +796,6 @@ void getThreadsLoad(TaskExecutorGetterImp &getter, API_ARGS_MAP_ASYNC) {
  */
 void installWebApi() {
     addHttpListener();
-    GET_CONFIG(string,api_secret,API::kSecret);
 
     // 获取线程负载  [AUTO-TRANSLATED:3b0ece5c]
     // Get thread load
@@ -1079,6 +1152,7 @@ void installWebApi() {
             }
             fillSockInfo(jsession, session.get());
             jsession["id"] = id;
+            jsession["type"] = session->getSock()->sockType() == SockNum::Sock_TCP ? "tcp" : "udp";
             jsession["typeid"] = toolkit::demangle(typeid(*session).name());
             val["data"].append(jsession);
         });
@@ -1183,19 +1257,19 @@ void installWebApi() {
     });
     api_regist("/index/api/listStreamPusherProxy", [](API_ARGS_MAP) {
         CHECK_SECRET();
-        s_pusher_proxy.for_each([&val](const std::string& key, const PusherProxy::Ptr& p) {
+        s_pusher_proxy.for_each([&val](const std::string &key, const PusherProxy::Ptr &p) {
             Json::Value item = ToJson(p);
             item["key"] = key;
             val["data"].append(item);
-        });
+        }, allArgs["key"]);
     });
     api_regist("/index/api/listStreamProxy", [](API_ARGS_MAP) {
         CHECK_SECRET();
-        s_player_proxy.for_each([&val](const std::string& key, const PlayerProxy::Ptr& p) {
+        s_player_proxy.for_each([&val](const std::string &key, const PlayerProxy::Ptr &p) {
             Json::Value item = ToJson(p);
             item["key"] = key;
             val["data"].append(item);
-        });
+        }, allArgs["key"]);
     });
     // 动态添加rtsp/rtmp拉流代理  [AUTO-TRANSLATED:2616537c]
     // Dynamically add rtsp/rtmp pull stream proxy
@@ -1222,8 +1296,8 @@ void installWebApi() {
             addStreamProxy(tuple,
                            allArgs["url"],
                            retry_count,
+                           allArgs["force"],
                            option,
-                           allArgs["rtp_type"],
                            allArgs["timeout_sec"],
                            args,
                            [invoker,val,headerOut](const SockException &ex,const string &key) mutable {
@@ -2106,10 +2180,14 @@ void installWebApi() {
         WebRtcPluginManager::Instance().negotiateSdp(session, type, *args, [invoker, offer, headerOut, location](const WebRtcInterface &exchanger) mutable {
             auto &handler = const_cast<WebRtcInterface &>(exchanger);
             try {
+                // Encode query params since transport id/token may contain '+' or '/'.
+                HttpArgs delete_args;
+                delete_args["id"] = exchanger.getIdentifier();
+                delete_args["token"] = exchanger.deleteRandStr();
                 // 设置返回类型  [AUTO-TRANSLATED:ffc2a31a]
                 // Set return type
                 headerOut["Content-Type"] = "application/sdp";
-                headerOut["Location"] = location + "?id=" + exchanger.getIdentifier() + "&token=" + exchanger.deleteRandStr();
+                headerOut["Location"] = location + "?" + delete_args.make();
                 invoker(201, headerOut, handler.getAnswerSdp(offer));
             } catch (std::exception &ex) {
                 headerOut["Content-Type"] = "text/plain";
@@ -2332,36 +2410,40 @@ void installWebApi() {
             }
         };
 
-        bool flag = NOTICE_EMIT(BroadcastHttpAccessArgs, Broadcast::kBroadcastHttpAccess, allArgs.parser, file_path, false, file_invoker, sender);
-        if (!flag) {
-            // 文件下载鉴权事件无人监听，不允许下载  [AUTO-TRANSLATED:5e02f0ce]
-            // No one is listening to the file download authentication event, download is not allowed
-            invoker(401, StrCaseMap {}, "None http access event listener");
+        try {
+            CHECK_SECRET();
+            // 校验secret成功，文件下载鉴权成功
+            file_invoker("", "", 0);
+        } catch (...) {
+            bool flag = NOTICE_EMIT(BroadcastHttpAccessArgs, Broadcast::kBroadcastHttpAccess, allArgs.parser,  allArgs.parser.url(), file_path, false, file_invoker, sender);
+            if (!flag) {
+                // 文件下载鉴权事件无人监听，不允许下载  [AUTO-TRANSLATED:5e02f0ce]
+                // No one is listening to the file download authentication event, download is not allowed
+                invoker(401, StrCaseMap {}, "None http access event listener");
+            }
         }
     });
-
 
     api_regist("/index/api/searchOnvifDevice",[](API_ARGS_MAP_ASYNC){
        CHECK_SECRET();
        CHECK_ARGS("timeout_ms");
 
-       auto result = std::make_shared<Value>(std::move(val));
-       auto complete_token = std::make_shared<onceToken>(nullptr, [result, headerOut, invoker]() {
-           invoker(200, headerOut, result->toStyledString());
-       });
-       auto lam_search = [complete_token, result](const std::map<string, string> &device_info,
-                                                  const std::string &onvif_url) {
-           Value obj;
-           obj["onvif_url"] = onvif_url;
-           for (auto &pr : device_info) {
-               obj[pr.first] = pr.second;
-           }
-           (*result)["data"].append(std::move(obj));
-           //继续等待扫描
-           return true;
-       };
-       OnvifSearcher::Instance().sendSearchBroadcast(std::move(lam_search), allArgs["timeout_ms"]);
-   });
+        string subnet_prefix = allArgs["subnet_prefix"];
+
+        auto result = std::make_shared<Value>(std::move(val));
+        auto complete_token = std::make_shared<onceToken>(nullptr, [result, headerOut, invoker]() { invoker(200, headerOut, result->toStyledString()); });
+        auto lam_search = [complete_token, result](const std::map<string, string> &device_info, const std::string &onvif_url) {
+            Value obj;
+            obj["onvif_url"] = onvif_url;
+            for (auto &pr : device_info) {
+                obj[pr.first] = pr.second;
+            }
+            (*result)["data"].append(std::move(obj));
+            //继续等待扫描
+            return true;
+        };
+        OnvifSearcher::Instance().sendSearchBroadcast(std::move(subnet_prefix), std::move(lam_search), allArgs["timeout_ms"]);
+    });
 
     api_regist("/index/api/getStreamUrl", [](API_ARGS_MAP_ASYNC) {
         CHECK_SECRET();
@@ -2385,6 +2467,61 @@ void installWebApi() {
             }
             invoker(200, headerOut, val.toStyledString());
         });
+    });
+
+    api_regist("/index/api/login", [](API_ARGS_MAP) {
+        auto logined_cookie = HttpCookieManager::Instance().getCookie(kLoginedCookieName, allArgs.getParser().getHeader());
+
+        CHECK_ARGS("digest");
+        GET_CONFIG(std::string, api_secret, API::kSecret);
+
+        auto unlogin_cookie = HttpCookieManager::Instance().getCookie(kUnLoginCookieName, allArgs.getParser().getHeader());
+        // MD5("zlmediakit:"+${secret}+":" +${cookie})
+        auto digest_ok = unlogin_cookie ? MD5("zlmediakit:" + api_secret + ":" + unlogin_cookie->getCookie()).hexdigest() : "";
+        if (!unlogin_cookie || digest_ok != allArgs["digest"]) {
+            if (!unlogin_cookie) {
+                unlogin_cookie = HttpCookieManager::Instance().addCookie(kUnLoginCookieName, "", kUnLoginCookieLifeSeconds);
+                headerOut["Set-Cookie"] = unlogin_cookie->getCookie(kLoginCookiePath);
+            }
+            val["cookie"] = unlogin_cookie->getCookie();
+            if (logined_cookie) {
+                // secret校验失败，注销登录
+                logined_cookie->setExpired();
+                HttpCookieManager::Instance().delCookie(logined_cookie);
+                headerOut.emplace_force("Set-Cookie", logined_cookie->getCookie(kLoginCookiePath));
+            }
+            throw AuthException("Digest does not match, incorrect secret?", headerOut, val);
+        }
+        if (!logined_cookie) {
+            // 未登陆状态，设置登录成功, cookie保持24小时
+            logined_cookie = HttpCookieManager::Instance().addCookie(kLoginedCookieName, "", kLoginedCookieLifeSeconds);
+            headerOut["Set-Cookie"] = logined_cookie->getCookie(kLoginCookiePath);
+        }
+
+        // 删除未登录状态的cookie
+        unlogin_cookie->setExpired();
+        HttpCookieManager::Instance().delCookie(unlogin_cookie);
+        headerOut.emplace_force("Set-Cookie", unlogin_cookie->getCookie(kLoginCookiePath));
+
+        val["code"] = API::Success;
+    });
+
+    api_regist("/index/api/logout", [](API_ARGS_MAP) {
+        auto logined_cookie = HttpCookieManager::Instance().getCookie(kLoginedCookieName, allArgs.getParser().getHeader());
+        if (logined_cookie) {
+            // 已经登录成功, 删除cookie
+            logined_cookie->setExpired();
+            HttpCookieManager::Instance().delCookie(logined_cookie);
+            headerOut["Set-Cookie"] = logined_cookie->getCookie(kLoginCookiePath);
+        } else {
+            val["msg"] = "You are not logined";
+        }
+        auto unlogin_cookie = HttpCookieManager::Instance().getCookie(kUnLoginCookieName, allArgs.getParser().getHeader());
+        if (!unlogin_cookie) {
+            unlogin_cookie = HttpCookieManager::Instance().addCookie(kUnLoginCookieName, "", kUnLoginCookieLifeSeconds);
+            headerOut["Set-Cookie"] = unlogin_cookie->getCookie(kLoginCookiePath);
+        }
+        val["cookie"] = unlogin_cookie->getCookie();
     });
 
 #if defined(ENABLE_VIDEOSTACK) && defined(ENABLE_X264) && defined(ENABLE_FFMPEG)
@@ -2431,6 +2568,122 @@ void installWebApi() {
         invoker(200, headerOut, val.toStyledString());
     });
 #endif
+
+    // 设置流播放速度
+    // Set stream playback speed
+    api_regist("/index/api/setStreamSpeed", [](API_ARGS_JSON_ASYNC) {
+        CHECK_SECRET();
+        CHECK_ARGS("vhost", "app", "stream", "speed");
+
+        std::string vhost = allArgs["vhost"];
+        std::string app = allArgs["app"];
+        std::string stream = allArgs["stream"];
+        float speed = allArgs["speed"].as<float>();
+
+        auto tuple = MediaTuple { vhost, app, stream, "" };
+        std::string key = tuple.shortUrl();
+        
+        auto player_proxy = s_player_proxy.find(key);
+        if (!player_proxy) {
+            throw ApiRetException("can not find the stream proxy", API::NotFound);
+        }
+        
+        player_proxy->getPoller()->async([=]() mutable {
+            player_proxy->MediaPlayer::speed(speed);
+            val["result"] = 0;
+            val["msg"] = "success";
+            val["code"] = API::Success;
+            invoker(200, headerOut, val.toStyledString());
+        });
+    });
+
+    // 暂停/恢复流播放
+    // Pause/Resume stream playback
+    api_regist("/index/api/pauseStream", [](API_ARGS_JSON_ASYNC) {
+        CHECK_SECRET();
+        CHECK_ARGS("vhost", "app", "stream");
+        
+        std::string vhost = allArgs["vhost"];
+        std::string app = allArgs["app"];
+        std::string stream = allArgs["stream"];
+        
+        auto tuple = MediaTuple { vhost, app, stream, "" };
+        std::string key = tuple.shortUrl();
+        
+        auto player_proxy = s_player_proxy.find(key);
+        if (!player_proxy) {
+            throw ApiRetException("can not find the stream proxy", API::NotFound);
+        }
+        
+        player_proxy->getPoller()->async([=]() mutable {
+            player_proxy->MediaPlayer::pause(true);
+            val["result"] = 0;
+            val["msg"] = "success";
+            val["code"] = API::Success;
+            invoker(200, headerOut, val.toStyledString());
+        });
+    });
+
+    // 跳转到指定位置
+    // Seek to specified position
+    api_regist("/index/api/seekStream", [](API_ARGS_JSON_ASYNC) {
+        CHECK_SECRET();
+        CHECK_ARGS("vhost", "app", "stream");
+        
+        std::string vhost = allArgs["vhost"];
+        std::string app = allArgs["app"];
+        std::string stream = allArgs["stream"]; 
+        uint32_t pos = allArgs["position"].as<uint32_t>();
+        
+        auto tuple = MediaTuple { vhost, app, stream, "" };
+        std::string key = tuple.shortUrl();
+        
+        auto player_proxy = s_player_proxy.find(key);
+        if (!player_proxy) {
+            throw ApiRetException("can not find the stream proxy", API::NotFound);
+        }
+        
+        player_proxy->getPoller()->async([=]() mutable {
+            player_proxy->MediaPlayer::seekTo(pos);
+            val["result"] = 0;
+            val["msg"] = "success";
+            val["code"] = API::Success;
+            invoker(200, headerOut, val.toStyledString());
+        });
+    });
+
+    api_regist("/index/api/addProbe", [](API_ARGS_MAP_ASYNC) {
+        CHECK_SECRET();
+        CHECK_ARGS("vhost", "app", "stream", "probe_ms");
+
+        std::string vhost = allArgs["vhost"];
+        std::string app = allArgs["app"];
+        std::string stream = allArgs["stream"];
+        uint32_t probe_ms = allArgs["probe_ms"];
+
+        auto src = MediaSource::find(vhost, app, stream);
+        if (!src) {
+            throw ApiRetException("can not find the stream", API::NotFound);
+        }
+        src->getOwnerPoller()->async([=]() mutable {
+            src->getMuxer()->addProbe(probe_ms, [=](const std::list<FrameInfo> &info_list) mutable {
+                for (const auto &info : info_list) {
+                    Json::Value item;
+                    item["codec"] = getCodecName(info.codec_id);
+                    item["track_type"] = getTrackString(getTrackType(info.codec_id));
+                    item["dts"] = (Json::Int64)info.dts;
+                    item["pts"] = (Json::Int64)info.pts;
+                    item["recv_stamp"] = (Json::Int64)info.recv_stamp;
+                    item["frame_size"] = (Json::UInt)info.frame_size;
+                    item["index"] = info.index;
+                    item["key_frame"] = info.key_frame;
+                    item["config_frame"] = info.config_frame;
+                    val["data"].append(std::move(item));
+                }
+                invoker(200, headerOut, val.toStyledString());
+            });
+        });
+    });
 }
 
 void unInstallWebApi(){

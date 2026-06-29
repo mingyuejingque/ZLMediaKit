@@ -42,15 +42,15 @@ void HttpSession::onHttpRequest_HEAD() {
 
 void HttpSession::onHttpRequest_OPTIONS() {
     KeyValue header;
-    header.emplace("Allow", "GET, POST, HEAD, OPTIONS");
+    header.emplace("Allow", "GET, POST, PUT, HEAD, OPTIONS, DELETE");
     GET_CONFIG(bool, allow_cross_domains, Http::kAllowCrossDomains);
     if (allow_cross_domains) {
         header.emplace("Access-Control-Allow-Origin", "*");
         header.emplace("Access-Control-Allow-Headers", "*");
-        header.emplace("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
+        header.emplace("Access-Control-Allow-Methods", "GET, POST, PUT, HEAD, OPTIONS, DELETE");
     }
     header.emplace("Access-Control-Allow-Credentials", "true");
-    header.emplace("Access-Control-Request-Methods", "GET, POST, OPTIONS");
+    header.emplace("Access-Control-Request-Methods", "GET, POST, PUT, OPTIONS, DELETE");
     header.emplace("Access-Control-Request-Headers", "Accept,Accept-Language,Content-Language,Content-Type");
     sendResponse(200, true, nullptr, header);
 }
@@ -61,6 +61,7 @@ ssize_t HttpSession::onRecvHeader(const char *header, size_t len) {
     static onceToken token([]() {
         s_func_map.emplace("GET", &HttpSession::onHttpRequest_GET);
         s_func_map.emplace("POST", &HttpSession::onHttpRequest_POST);
+        s_func_map.emplace("PUT", &HttpSession::onHttpRequest_POST);
         // DELETE命令用于whip/whep用，只用于触发http api  [AUTO-TRANSLATED:f3b7aaea]
         // DELETE command is used for whip/whep, only used to trigger http api
         s_func_map.emplace("DELETE", &HttpSession::onHttpRequest_POST);
